@@ -1,0 +1,284 @@
+import os
+import discord
+from discord.ext import commands
+import random
+import string
+import asyncio
+import json
+from datetime import datetime
+
+# Enter your token here
+TOKEN = "" 
+
+# Channel_category_id
+MATCH_CATEGORY_ID = 1309315592750235698
+
+class EloSystem:
+    def __init__(self):
+        self.rating_floor = 1000
+
+    def get_k_factor(self, rating: int, is_winner: bool = None) -> int:
+        # Special behavior for ratings 1000-1099
+        if rating == 1000 and is_winner is not None:
+            return 80 if is_winner else 20
+        elif 1001 <= rating <= 1099 and is_winner is not None:
+            # Linear scaling between (1000, 80/20) and (1100, 50/50)
+            progress = (rating - 1000) / 100
+            if is_winner:
+                return 80 - (30 * progress)  # Scales from 80 to 50
+            else:
+                return 20 + (30 * progress)  # Scales from 20 to 50
+
+        # Standard K-factor scaling
+        if rating < 1100:
+            return 50
+        elif 1100 <= rating <= 1299:
+            return 50
+        elif 1300 <= rating <= 1599:
+            return 40
+        else:  # 1600+
+            return 32
+
+    def calculate_expected_score(self, rating_a: int, rating_b: int) -> float:
+        return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
+
+    def calculate_new_ratings(self, winner_rating: int, loser_rating: int) -> tuple[int, int]:
+        # Expected scores
+        winner_expected = self.calculate_expected_score(winner_rating, loser_rating)
+        loser_expected = 1 - winner_expected
+
+        # Get K-factors
+        winner_k = self.get_k_factor(winner_rating, True)
+        loser_k = self.get_k_factor(loser_rating, False)
+
+        # Calculate new ratings
+        new_winner_rating = round(winner_rating + winner_k * (1 - winner_expected))
+        new_loser_rating = round(loser_rating + loser_k * (0 - loser_expected))
+
+        # Apply rating floor
+        new_loser_rating = max(self.rating_floor, new_loser_rating)
+
+        return new_winner_rating, new_loser_rating
+
+class QueueCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.group(invoke_without_command=True)
+    async def queue(self, ctx):
+        await ctx.send("Invalid queue command. Use '!queue join' or '!queue leave'")
+
+    @queue.command(name='join')
+    async def queue_join(self, ctx):
+        if ctx.author not in self.bot.player_queue:
+            self.bot.player_queue.append(ctx.author)
+            await ctx.send(f"{ctx.author.mention} joined the queue!")
+            if len(self.bot.player_queue) >= 2:
+                player1 = self.bot.player_queue.pop(0)
+                player2 = self.bot.player_queue.pop(0)
+                await self.bot.create_match_room(player1, player2)
+
+    @queue.command(name='leave')
+    async def queue_leave(self, ctx):
+        if ctx.author in self.bot.player_queue:
+            self.bot.player_queue.remove(ctx.author)
+            await ctx.send(f"{ctx.author.mention} left the queue.")
+
+class PokemonPocketBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.all()
+        intents.message_content = True
+        super().__init__(command_prefix='!', intents=intents)
+
+        # Data storage
+        self.player_queue = []
+        self.active_matches = {}
+        self.rankings = {}
+        self.monthly_rankings = {}
+        self.elo_system = EloSystem()
+
+        # Add commands
+        self.add_commands()
+
+    def add_commands(self):
+        @self.command(name='leaderboard')
+        async def leaderboard(ctx, type: str = "all"):
+            if type.lower() not in ["all", "monthly"]:
+                await ctx.send("Invalid leaderboard type. Use '!leaderboard' or '!leaderboard monthly'")
+                return
+
+            if type.lower() == "monthly":
+                current_month = datetime.now().strftime('%Y-%m')
+                rankings_data = self.monthly_rankings.get(current_month, {})
+                title = f"Monthly Leaderboard ({datetime.now().strftime('%B %Y')}):"
+            else:
+                rankings_data = self.rankings
+                title = "All-Time Leaderboard:"
+
+            if not rankings_data:
+                await ctx.send(f"No rankings yet for {title}!")
+                return
+
+            guild_members = ctx.guild.members
+            member_dict = {str(member.id): member for member in guild_members}
+
+            sorted_rankings = sorted(rankings_data.items(), key=lambda x: x[1], reverse=True)
+            leaderboard_text = f"```\n{title}\n"
+
+            for i, (player_id, rank) in enumerate(sorted_rankings[:10], 1):
+                member = member_dict.get(player_id)
+                if member:
+                    name = member.display_name
+                else:
+                    try:
+                        user = await self.fetch_user(int(player_id))
+                        name = user.name
+                    except:
+                        name = f"Unknown Player ({player_id})"
+
+                leaderboard_text += f"{i}. {name}: {rank}\n"
+
+            leaderboard_text += "```"
+            await ctx.send(leaderboard_text)
+
+        @self.command(name='ranking')
+        async def ranking(ctx, action: str = None, player: discord.Member = None):
+            if action == "clear" and not ctx.author.guild_permissions.administrator:
+                await ctx.send("You don't have permission to clear rankings!")
+                return
+
+            if action == "clear":
+                if player:
+                    if str(player.id) in self.rankings:
+                        self.rankings.pop(str(player.id))
+                        current_month = datetime.now().strftime('%Y-%m')
+                        if current_month in self.monthly_rankings and str(player.id) in self.monthly_rankings[current_month]:
+                            self.monthly_rankings[current_month].pop(str(player.id))
+                        await ctx.send(f"Rankings cleared for {player.display_name}")
+                else:
+                    self.rankings = {}
+                    self.monthly_rankings = {}
+                    await ctx.send("All rankings have been cleared!")
+                await self.save_rankings()
+                return
+
+            player = player or ctx.author
+            rank = self.rankings.get(str(player.id), 1000)
+            current_month = datetime.now().strftime('%Y-%m')
+            monthly_rank = self.monthly_rankings.get(current_month, {}).get(str(player.id), 1000)
+
+            await ctx.send(f"{player.mention}'s rankings:\nAll-time: {rank}\nMonthly: {monthly_rank}")
+
+    async def setup_hook(self):
+        print("Bot is setting up...")
+        await self.add_cog(QueueCog(self))
+        await self.tree.sync()
+
+    async def on_ready(self):
+        print(f'Logged in as {self.user}')
+        print(f'Bot is in {len(self.guilds)} guilds')
+        await self.load_rankings()
+        print("All commands are ready!")
+        commands_list = [command.name for command in self.commands]
+        print(f"Available commands: {', '.join(commands_list)}")
+
+    async def load_rankings(self):
+        try:
+            with open('rankings.json', 'r') as f:
+                data = json.load(f)
+                self.rankings = data.get('all_time', {})
+                self.monthly_rankings = data.get('monthly', {})
+        except FileNotFoundError:
+            self.rankings = {}
+            self.monthly_rankings = {}
+
+    async def save_rankings(self):
+        with open('rankings.json', 'w') as f:
+            json.dump({
+                'all_time': self.rankings,
+                'monthly': self.monthly_rankings
+            }, f)
+
+    async def create_match_room(self, player1, player2):
+        match_code = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+
+        overwrites = {
+            player1: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            player2: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            self.user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+
+        category = self.get_channel(MATCH_CATEGORY_ID)
+        match_channel = await category.create_text_channel(
+            f"match-{match_code}", 
+            overwrites=overwrites
+        )
+
+        self.active_matches[match_channel.id] = {
+            'players': [player1.id, player2.id],
+            'match_code': match_code,
+            'winner_claimed': None
+        }
+
+        await match_channel.send(f"Match started! Match Code: {match_code}")
+        await match_channel.send(f"Players: {player1.mention} vs {player2.mention}")
+
+    async def on_message(self, message):
+        if message.author == self.user:
+            return
+
+        if message.channel.id in self.active_matches:
+            match_details = self.active_matches[message.channel.id]
+
+            if message.content.lower() == '!win':
+                if message.author.id in match_details['players']:
+                    match_details['winner_claimed'] = message.author.id
+                    await message.channel.send("Win claimed! Waiting for opponent confirmation.")
+
+            elif message.content.lower() == '!confirm':
+                winner_id = match_details['winner_claimed']
+                if winner_id and message.author.id in match_details['players'] and message.author.id != winner_id:
+                    winner = await self.fetch_user(winner_id)
+                    loser = message.author
+
+                    # Update all-time rankings
+                    winner_rank = self.rankings.get(str(winner.id), 1000)
+                    loser_rank = self.rankings.get(str(loser.id), 1000)
+
+                    # Calculate new ratings
+                    new_winner_rank, new_loser_rank = self.elo_system.calculate_new_ratings(
+                        winner_rank, loser_rank
+                    )
+
+                    self.rankings[str(winner.id)] = new_winner_rank
+                    self.rankings[str(loser.id)] = new_loser_rank
+
+                    # Update monthly rankings
+                    current_month = datetime.now().strftime('%Y-%m')
+                    if current_month not in self.monthly_rankings:
+                        self.monthly_rankings[current_month] = {}
+
+                    monthly_winner_rank = self.monthly_rankings[current_month].get(str(winner.id), 1000)
+                    monthly_loser_rank = self.monthly_rankings[current_month].get(str(loser.id), 1000)
+
+                    new_monthly_winner_rank, new_monthly_loser_rank = self.elo_system.calculate_new_ratings(
+                        monthly_winner_rank, monthly_loser_rank
+                    )
+
+                    self.monthly_rankings[current_month][str(winner.id)] = new_monthly_winner_rank
+                    self.monthly_rankings[current_month][str(loser.id)] = new_monthly_loser_rank
+
+                    await self.save_rankings()
+                    await message.channel.send(f"""Match result confirmed and rankings updated!
+Winner: {winner.mention} ({winner_rank} → {new_winner_rank})
+Loser: {loser.mention} ({loser_rank} → {new_loser_rank})""")
+                    await message.channel.delete()
+                    del self.active_matches[message.channel.id]
+
+            elif message.content.lower() == '!help':
+                await message.channel.send("Administrator will be notified. Please describe the issue.")
+
+        await self.process_commands(message)
+
+bot = PokemonPocketBot()
+bot.run(TOKEN)
